@@ -1,0 +1,17 @@
+langchain-core
+python-dotenv
+langchain
+langchain-classic
+langchain-community
+langgraph
+langchain-openai
+pydantic
+fastapi
+uvicorn
+python-multipart
+streamlit
+requests
+langsmith
+huggingface-hub
+traceback
+tavily
