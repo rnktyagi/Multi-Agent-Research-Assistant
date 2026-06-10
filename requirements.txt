@@ -13,5 +13,4 @@ streamlit
 requests
 langsmith
 huggingface-hub
-traceback
 tavily
