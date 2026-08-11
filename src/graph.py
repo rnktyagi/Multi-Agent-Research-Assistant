@@ -1,72 +1,97 @@
-from langgraph.graph import StateGraph , START , END
-from typing import Annotated , TypedDict , List
-from pydantic import BaseModel , Field
-import operator
-from langchain_openai import ChatOpenAI
-import os
-from dotenv import load_dotenv
-from langchain.agents import create_agent
-from src.tools import web_search_tool
-from langgraph.types import Send
+from langgraph .graph import StateGraph ,START ,END 
+from typing import Annotated ,TypedDict ,List ,Optional 
+from pydantic import BaseModel ,Field 
+from langchain_openai import ChatOpenAI 
+import os 
+import asyncio 
+from dotenv import load_dotenv 
+from langchain .agents import create_agent 
+from src .tools import web_search_tool 
+from langgraph .types import Send 
 
-load_dotenv()
+load_dotenv ()
 
-llm = ChatOpenAI(model="openai/gpt-4o-mini",
-                openai_api_key=os.getenv("OPENROUTER_API_KEY"),
-                openai_api_base="https://openrouter.ai/api/v1",
-                temperature=0,
-                max_tokens=10000)
+llm =ChatOpenAI (
+model ="llama-3.3-70b-versatile",
+openai_api_key =os .getenv ("GROQ_API_KEY"),
+openai_api_base ="https://api.groq.com/openai/v1",
+temperature =0 ,
+)
 
-class PlannerState(BaseModel) :
-    objectives : List[str] = Field(..., description="The objectives for the given user input to conduct a research on.")
+MAX_PARALLEL_CALLS =2 
+RETRY_COUNT =3 
+WAIT_SECONDS_BETWEEN_RETRIES =3 
 
-class ResearchState(BaseModel) :
-    source : List[str] = Field(...,description="The list of all sources the research is conducted from.")
-    content : List[str] = Field(...,description="The actual content after the research is conducted by the agent.")
+LLM_SEMAPHORE =asyncio .Semaphore (MAX_PARALLEL_CALLS )
 
-class SynthesizeState(BaseModel) :
-    facts : List[str] = Field(...,description="The collection consisting of actual facts and relevant information enriched for effictive writing only without any noise in data.")
 
-class CrtiqueState(BaseModel) :
-    is_approved : bool = Field(...,description="Analysis result of the written report if it is remarkably good enough or not.")
-    improvements : List[str] = Field(... , description="Strictly mentioning of points of improvemets needed in the current report.")
-    fallback_agent: str = Field(...,description="It return the name of the agent to fallback to for improvement.")
+async def invoke_agent_safely (agent ,messages ):
+    async with LLM_SEMAPHORE :
+        for attempt in range (RETRY_COUNT ):
+            try :
+                response =await agent .ainvoke ({"messages":messages })
 
-class ResearchOutput(TypedDict) :
-    objective: str
-    source : List[str] 
-    content : List[str]
 
-class FactOutput(TypedDict):
-    objective: str
-    facts: List[str]
 
-class State(TypedDict) :
-    user_query : str
-    objectives : List[str]
-    current_objective : str
-    research_output : Annotated[List[ResearchOutput] , operator.add]
-    current_research : List[ResearchOutput]
-    facts : Annotated[List[FactOutput] , operator.add]
-    written_report : str
-    is_approved : bool
-    improvements : List[str]
-    fallback_agent : str
-    retry : int 
+                if "structured_response"in response and response ["structured_response"]is None :
+                    raise ValueError ("Model did not return a valid structured response.")
 
-class ResearchSubState(TypedDict):
-    current_objective: str
+                return response 
 
-class SynthesizeSubState(TypedDict):
-    individual_research: ResearchOutput
+            except Exception as e :
+                print (f"Attempt {attempt +1 }/{RETRY_COUNT } failed: {e }")
+                if attempt ==RETRY_COUNT -1 :
+                    raise 
+                await asyncio .sleep (WAIT_SECONDS_BETWEEN_RETRIES )
 
-def planner_agent_node(state : State) :
-    query = state.get("user_query" , "")
-    improvements = state.get("improvements" , ["No improvements needed right now."])
+class PlannerState (BaseModel ):
+    objectives :List [str ]=Field (...,description ="The objectives for the given user input to conduct a research on.")
+class ResearchState (BaseModel ):
+    source :List [str ]=Field (...,description ="The list of all sources the research is conducted from.")
+    content :List [str ]=Field (...,description ="The actual content after the research is conducted by the agent.")
+class SynthesizeState (BaseModel ):
+    facts :List [str ]=Field (...,description ="Collection of clean, enriched facts for effective writing, without noise.")
+class CritiqueState (BaseModel ):
+    is_approved :bool =Field (...,description ="Whether the report is good enough or not.")
+    improvements :List [str ]=Field (...,description ="Points of improvement needed in the current report.")
+    fallback_agent :str =Field (...,description ="Name of the agent to fall back to for improvement.")
+class ResearchOutput (TypedDict ):
+    objective :str 
+    source :List [str ]
+    content :List [str ]
+class FactOutput (TypedDict ):
+    objective :str 
+    facts :List [str ]
 
-    improvement_context = '\n'.join(improvements)
+def merge_or_reset (existing :Optional [list ],new :Optional [list ])->list :
+    if new is None :
+        return []
+    if existing is None :
+        existing =[]
+    return existing +new 
 
-    prompt = f"""
+class State (TypedDict ):
+    user_query :str 
+    objectives :List [str ]
+    current_objective :str 
+    research_output :Annotated [List [ResearchOutput ],merge_or_reset ]
+    facts :Annotated [List [FactOutput ],merge_or_reset ]
+    written_report :str 
+    is_approved :bool 
+    improvements :List [str ]
+    fallback_agent :str 
+    retry :int 
+class ResearchSubState (TypedDict ):
+    current_objective :str 
+class SynthesizeSubState (TypedDict ):
+    individual_research :ResearchOutput 
+
+async def planner_agent_node (state :State ):
+    query =state .get ("user_query","")
+    improvements =state .get ("improvements",["No improvements needed right now."])
+    improvement_context ="\n".join (improvements )
+
+    prompt =f"""
     <role>
     You are a planner agent in a multi-agent research assistant. Your job is to break the user query into a small sequence of research objectives.
     </role>
@@ -86,27 +111,32 @@ def planner_agent_node(state : State) :
     - Do not shuffle objectives randomly.
     - Do not add explanations or extra text.
     </constraints>
-    
+
     <improvements>
-        {improvement_context}
+        {improvement_context }
     </improvements>"""
 
-    planner_agent = create_agent(model=llm , system_prompt=prompt , response_format=PlannerState)
+    planner_agent =create_agent (model =llm ,system_prompt =prompt ,response_format =PlannerState )
 
-    result  = planner_agent.invoke({"messages": [("user", query)]})
+    try :
+        result =await invoke_agent_safely (planner_agent ,[("user",query )])
+        structured =result .get ("structured_response")
+        if structured is None :
+            raise ValueError ("Model did not return a valid structured response.")
+        objectives =structured .objectives 
+    except Exception as e :
 
-    objectives = result.get("structured_response").objectives
-
+        raise RuntimeError (f"Planner agent failed to generate objectives: {e }")
     return {
-        "objectives" : objectives,
-        "research_output": [],
-        "facts": []
+    "objectives":objectives ,
+    "research_output":None ,
+    "facts":None ,
     }
 
-def research_agent_node(state : ResearchSubState) :
-    objective = state.get("current_objective" , "")
-    
-    prompt = f"""
+async def research_agent_node (state :ResearchSubState ):
+    objective =state .get ("current_objective","")
+
+    prompt =f"""
 <role>
 You are an enterprise research agent in a multi-agent research assistant.
 Your responsibility is to research a single objective and return verified findings.
@@ -141,28 +171,45 @@ Use this tool to retrieve recent and reliable information.
 </constraints>
 """
 
-    research_agent = create_agent(model=llm , tools=[web_search_tool] , response_format=ResearchState , system_prompt=prompt)
+    research_agent =create_agent (model =llm ,tools =[web_search_tool ],response_format =ResearchState ,system_prompt =prompt )
 
-    response = research_agent.invoke({'messages' : [('user' , objective)]})
+    try :
+        response =await invoke_agent_safely (research_agent ,[("user",objective )])
+        result =response .get ("structured_response")
+        if result is None :
+            raise ValueError ("Model did not return a valid structured response.")
+    except Exception as e :
 
-    result = response.get("structured_response")
+
+        print (f"[research_agent_node] Failed for objective '{objective }': {e }")
+        result =ResearchState (source =[],content =[f"Research failed for this objective: {e }"])
 
     return {
-        'research_output' : [{
-            'objective' : objective,
-            'source' : result.source,
-            'content' : result.content
-        }]
+    "research_output":[{
+    "objective":objective ,
+    "source":result .source ,
+    "content":result .content ,
+    }]
     }
 
-def parallel_objective_node(state : State) :
-    return [Send("research_agent_node", {"current_objective": obj}) for obj in state.get("objectives", [])]
+def parallel_objective_node (state :State ):
+    return [Send ("research_agent_node",{"current_objective":obj })for obj in state .get ("objectives",[])]
 
-def synthesizer_agent_node(state : SynthesizeSubState) :
-    research_chunk = state.get("individual_research")
-    objective = research_chunk.get("objective")
-    
-    prompt = f"""
+async def research_join_node (state :State ):
+    return {}
+
+def route_to_synthesis (state :State ):
+    deduped ={}
+    for item in state .get ("research_output",[]):
+        deduped [item ["objective"]]=item 
+
+    return [Send ("synthesizer_agent_node",{"individual_research":res })for res in deduped .values ()]
+
+async def synthesizer_agent_node (state :SynthesizeSubState ):
+    research_chunk =state .get ("individual_research")
+    objective =research_chunk .get ("objective")
+
+    prompt ="""
 <role>
 You are a professional synthesizer agent in a enterprise multi-agent research assistant whose job is to read every source and refined content and generate extract facts with citations for effective report writing.
 </role>
@@ -183,7 +230,7 @@ Content : Researched Content from source 2
 <instructions>
 - generate clean, concise and knowledge enriched facts extracted from the given input for effective report writing.
 - provide citations with very extracted and generated facts.
-- the output should be clean and understandable by a large language model 
+- the output should be clean and understandable by a large language model
 - every fact should be new, spontaneous and different in meaning
 - the number of facts generated should be ideal
 </instructions>
@@ -192,56 +239,54 @@ Content : Researched Content from source 2
 - Do not generate duplicated facts
 - Do not generate noise, unrelated or vague facts
 - The length of the generated should not be overly long
-- Do not produce large number of facts 
+- Do not produce large number of facts
 </constraints>
 """
 
-    query_result = []
+    sources =research_chunk .get ("source",[])
+    contents =research_chunk .get ("content",[])
 
-    sources = research_chunk.get("source" , [])
-    contents = research_chunk.get("content" , [])
+    query_result =[f"Source : {src }\nContent : {cnt }"for src ,cnt in zip (sources ,contents )]
+    query ="\n\n".join (query_result )
 
-    for src , cnt in zip(sources , contents) :
-        res = f"Source : {src}\nContent : {cnt}"
-        query_result.append(res)
+    synthesizer_agent =create_agent (model =llm ,response_format =SynthesizeState ,system_prompt =prompt )
 
-    query = "\n\n".join(query_result)
-
-    synthesizer_agent = create_agent(model=llm , response_format=SynthesizeState , system_prompt=prompt)
-
-    response = synthesizer_agent.invoke({"messages" : [("user" , query)]})
-
-    result = response.get("structured_response").facts
+    try :
+        response =await invoke_agent_safely (synthesizer_agent ,[("user",query )])
+        structured =response .get ("structured_response")
+        if structured is None :
+            raise ValueError ("Model did not return a valid structured response.")
+        result =structured .facts 
+    except Exception as e :
+        print (f"[synthesizer_agent_node] Failed for objective '{objective }': {e }")
+        result =[f"Synthesis failed for this objective: {e }"]
 
     return {
-        "facts" : [{
-            "objective": objective,
-            "facts": result
-        }]
+    "facts":[{
+    "objective":objective ,
+    "facts":result ,
+    }]
     }
 
-def parallel_research_node(state : State) :
-    return [Send("synthesizer_agent_node", {"individual_research": res}) for res in state.get("research_output", [])]
+async def writer_agent_node (state :State ):
+    objectives =state .get ("objectives",[])
+    raw_facts =state .get ("facts",[])
+    improvements =state .get ("improvements",["No improvements needed right now."])
+    improvement_context ="\n".join (improvements )
 
-def writer_agent_node(state : State) :
-    objectives = state.get("objectives" , [])
-    raw_facts = state.get("facts" , [])
-    improvements = state.get("improvements" , ["No improvements needed right now."])
 
-    improvement_context = '\n'.join(improvements)
 
-    fact_map = {item["objective"]: item["facts"] for item in raw_facts}
+    fact_map ={item ["objective"]:item ["facts"]for item in raw_facts }
 
-    context_build = []
-
+    context_build =[]
     for obj in objectives :
-        obj_facts = fact_map.get(obj, ["No facts found."])
-        fct_str = "\n".join(f"- {f}" for f in obj_facts)
-        context_build.append(f"Objective : {obj}\nFacts : \n{fct_str}")
+        obj_facts =fact_map .get (obj ,["No facts found."])
+        fct_str ="\n".join (f"- {f }"for f in obj_facts )
+        context_build .append (f"Objective : {obj }\nFacts : \n{fct_str }")
 
-    context = "\n\n".join(context_build)
+    context ="\n\n".join (context_build )
 
-    prompt = f"""
+    prompt =f"""
 <role>
 You are professional report writer agent present in a enterprise multi-agent research assistant and your job is to create a professional and efficient report for the given context.
 </role>
@@ -296,28 +341,29 @@ Objectives are given in a foundational context to deeper analysis order.
 </constraints>
 
 <improvements>
-        {improvement_context}
+        {improvement_context }
 </improvements>
 """
 
-    writer_agent = create_agent(model=llm , system_prompt=prompt)
+    writer_agent =create_agent (model =llm ,system_prompt =prompt )
 
-    result = writer_agent.invoke({"messages" : [("user" , context)]})
+    try :
+        result =await invoke_agent_safely (writer_agent ,[("user",context )])
+        report_text =result ["messages"][-1 ].content 
+    except Exception as e :
+        raise RuntimeError (f"Writer agent failed to generate report: {e }")
 
-    return {
-        'written_report' : result["messages"][-1].content
-    }
+    return {"written_report":report_text }
 
-def critique_agent_node(state : State) :
-    objectives = state.get("objectives" , [])
-    report = state.get("written_report" , "")
-    current_retry = state.get("retry", 0)
+async def critique_agent_node (state :State ):
+    objectives =state .get ("objectives",[])
+    report =state .get ("written_report","")
+    current_retry =state .get ("retry",0 )
 
-    objectives_context = " ".join(objectives)
+    objectives_context =" ".join (objectives )
+    query =f"Objectives : {objectives_context }\nReport :\n{report }\n"
 
-    query = f"Objectives : {objectives_context}\nReport :\n{report}\n"
-
-    prompt = """
+    prompt ="""
 <role>
 You are a quality assurance and critique agent in an enterprise multi-agent research assistant.
 
@@ -408,6 +454,8 @@ If uncertain, prefer writer as the fallback agent.
 - Reject only when meaningful deficiencies exist.
 - Keep feedback concise and actionable.
 - Focus on major quality concerns only.
+- Reject if any citation contains placeholder text instead of a real source 
+(e.g. "[url1]", "[source]", "[TBD]", or similar bracketed stand-ins).
 
 </instructions>
 
@@ -434,53 +482,62 @@ If uncertain, prefer writer as the fallback agent.
 
 </constraints>"""
 
-    critique_agent = create_agent(model=llm , system_prompt=prompt , response_format=CrtiqueState)
+    critique_agent =create_agent (model =llm ,system_prompt =prompt ,response_format =CritiqueState )
 
-    response = critique_agent.invoke({"messages" : [("user" , query)]})
+    try :
+        response =await invoke_agent_safely (critique_agent ,[("user",query )])
+        result =response .get ("structured_response")
+    except Exception as e :
 
-    result = response.get("structured_response")
+        print (f"[critique_agent_node] Failed, defaulting to approval: {e }")
+        return {
+        "is_approved":True ,
+        "improvements":[f"Critique step failed: {e }"],
+        "fallback_agent":"END",
+        "retry":current_retry +1 ,
+        }
 
     return {
-        'is_approved' :  result.is_approved, 
-        'improvements' : result.improvements,
-        'fallback_agent' : result.fallback_agent,
-        'retry' : current_retry + 1
+    "is_approved":result .is_approved ,
+    "improvements":result .improvements ,
+    "fallback_agent":result .fallback_agent ,
+    "retry":current_retry +1 ,
     }
 
-def route_after_critique(state: State):
-    if state.get("is_approved") or state.get("retry", 0) >= 2:
-        return END
-        
-    agent_target = state.get("fallback_agent", "writer").lower()
-    
-    if agent_target == "planner":
+
+def route_after_critique (state :State ):
+    if state .get ("is_approved")or state .get ("retry",0 )>=2 :
+        return END 
+
+    agent_target =state .get ("fallback_agent","writer").lower ()
+
+    if agent_target =="planner":
         return "planner_agent_node"
-        
-    elif agent_target == "researcher":
-        return [Send("research_agent_node", {"current_objective": obj}) 
-                for obj in state.get("objectives", [])]
-                
-    elif agent_target == "synthesizer":
-        return [Send("synthesizer_agent_node", {"current_research": res}) 
-                for res in state.get("research_output", [])]
-                
-    else:
+
+    elif agent_target =="researcher":
+        return [Send ("research_agent_node",{"current_objective":obj })
+        for obj in state .get ("objectives",[])]
+
+    elif agent_target =="synthesizer":
+        return [Send ("synthesizer_agent_node",{"individual_research":res })
+        for res in state .get ("research_output",[])]
+
+    else :
         return "writer_agent_node"
-    
 
-workflow = StateGraph(State)
-    
-workflow.add_node("planner_agent_node", planner_agent_node)
-workflow.add_node("research_agent_node", research_agent_node)
-workflow.add_node("synthesizer_agent_node", synthesizer_agent_node)
-workflow.add_node("writer_agent_node", writer_agent_node)
-workflow.add_node("critique_agent_node", critique_agent_node)
+workflow =StateGraph (State )
 
-workflow.add_edge(START, "planner_agent_node")
-workflow.add_conditional_edges("planner_agent_node", parallel_objective_node)
-workflow.add_conditional_edges("research_agent_node", parallel_research_node)
-workflow.add_edge("synthesizer_agent_node", "writer_agent_node")
-workflow.add_edge("writer_agent_node", "critique_agent_node")
-workflow.add_conditional_edges("critique_agent_node", route_after_critique)
+workflow .add_node ("planner_agent_node",planner_agent_node )
+workflow .add_node ("research_agent_node",research_agent_node )
+workflow .add_node ("research_join_node",research_join_node )
+workflow .add_node ("synthesizer_agent_node",synthesizer_agent_node )
+workflow .add_node ("writer_agent_node",writer_agent_node )
+workflow .add_node ("critique_agent_node",critique_agent_node )
 
-agent = workflow.compile()
+workflow .add_edge (START ,"planner_agent_node")
+workflow .add_conditional_edges ("planner_agent_node",parallel_objective_node )
+workflow .add_edge ("research_agent_node","research_join_node")
+workflow .add_conditional_edges ("research_join_node",route_to_synthesis )
+workflow .add_edge ("synthesizer_agent_node","writer_agent_node")
+workflow .add_edge ("writer_agent_node","critique_agent_node")
+workflow .add_conditional_edges ("critique_agent_node",route_after_critique )
