@@ -7,7 +7,7 @@ st.set_page_config(
     layout="centered"
 )
 
-BACKEND_URL = "http://localhost:8000/research"
+BACKEND_URL = "https://lightrt-research-assistant-backend.hf.space/research"
 
 st.title("🔍 Multi-Agent Research Assistant")
 st.markdown(
